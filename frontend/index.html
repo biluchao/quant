@@ -1,0 +1,1146 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="color-scheme" content="light dark">
+    <title>Quant System · Step 1</title>
+    <link rel="icon" type="image/x-icon" href="assets/favicon.ico">
+
+    <!--
+      主题预加载：在 DOM 渲染前应用主题，避免闪白。
+      优先级：localStorage > 系统偏好 > 默认深色
+    -->
+    <script>
+        (function () {
+            try {
+                const saved = localStorage.getItem('quant_theme');
+                const prefersDark = window.matchMedia &&
+                    window.matchMedia('(prefers-color-scheme: dark)').matches;
+                const theme = saved || (prefersDark ? 'dark' : 'light');
+                document.documentElement.setAttribute('data-theme', theme);
+            } catch (e) {
+                document.documentElement.setAttribute('data-theme', 'dark');
+            }
+        })();
+    </script>
+
+    <!-- 外部样式（可选增强，见 css/dashboard.css） -->
+    <link rel="stylesheet" href="css/dashboard.css">
+
+    <!--
+      关键内联样式：保证 index.html 单独打开也能正确渲染。
+      外部 dashboard.css 可在此基础上细化。
+    -->
+    <style>
+        /* ============================================================
+           1. 主题变量
+           ============================================================ */
+        :root,
+        [data-theme="dark"] {
+            color-scheme: dark;
+
+            /* 背景层级 */
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --bg-hover: #30363d;
+
+            /* 文字 */
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --text-muted: #6e7681;
+
+            /* 边框 */
+            --border-default: #30363d;
+            --border-muted: #21262d;
+
+            /* 强调色 */
+            --accent: #58a6ff;
+            --accent-hover: #79c0ff;
+
+            /* 语义色 */
+            --color-profit: #3fb950;
+            --color-loss: #f85149;
+            --color-neutral: #8b949e;
+
+            /* 风险等级 */
+            --risk-normal: #3fb950;
+            --risk-warn: #d29922;
+            --risk-reduce: #fb8500;
+            --risk-close-only: #f0883e;
+            --risk-halt: #da3633;
+
+            /* 阴影 */
+            --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+            --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.4);
+        }
+
+        [data-theme="light"] {
+            color-scheme: light;
+
+            --bg-primary: #ffffff;
+            --bg-secondary: #f6f8fa;
+            --bg-tertiary: #eaeef2;
+            --bg-hover: #d0d7de;
+
+            --text-primary: #1f2328;
+            --text-secondary: #656d76;
+            --text-muted: #8c959f;
+
+            --border-default: #d0d7de;
+            --border-muted: #eaeef2;
+
+            --accent: #0969da;
+            --accent-hover: #0550ae;
+
+            --color-profit: #1a7f37;
+            --color-loss: #cf222e;
+            --color-neutral: #656d76;
+
+            --risk-normal: #1a7f37;
+            --risk-warn: #9a6700;
+            --risk-reduce: #bf8700;
+            --risk-close-only: #bc4c00;
+            --risk-halt: #cf222e;
+
+            --shadow-sm: 0 1px 2px rgba(31, 35, 40, 0.04);
+            --shadow-md: 0 3px 6px rgba(31, 35, 40, 0.15);
+        }
+
+        /* ============================================================
+           2. Reset + 基础
+           ============================================================ */
+        *,
+        *::before,
+        *::after {
+            box-sizing: border-box;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+        }
+
+        html {
+            /* 4K 缩放：1920px → 16px, 3840px → 24px */
+            font-size: clamp(14px, 0.52vw + 6px, 24px);
+            -webkit-text-size-adjust: 100%;
+        }
+
+        body {
+            font-family:
+                -apple-system, BlinkMacSystemFont, "Segoe UI",
+                "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+                "Helvetica Neue", sans-serif;
+            font-size: 1rem;
+            line-height: 1.5;
+            color: var(--text-primary);
+            background: var(--bg-primary);
+            min-height: 100vh;
+            min-height: 100dvh;
+            overflow: hidden;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        /* 数字等宽，避免跳动 */
+        .num {
+            font-variant-numeric: tabular-nums;
+            font-feature-settings: "tnum";
+            font-family:
+                "SF Mono", "Cascadia Code", "Consolas",
+                "Liberation Mono", monospace;
+        }
+
+        button {
+            font-family: inherit;
+            font-size: inherit;
+            cursor: pointer;
+            border: none;
+            background: none;
+            color: inherit;
+        }
+
+        button:focus-visible,
+        [tabindex]:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+
+        /* 滚动条样式 */
+        ::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--bg-hover);
+            border-radius: 5px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--text-muted);
+        }
+
+        /* ============================================================
+           3. 布局
+           ============================================================ */
+        .dashboard {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            height: 100dvh;
+            overflow: hidden;
+        }
+
+        /* ---------- 3.1 顶栏 ---------- */
+        .topbar {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 0.5rem 1rem;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-default);
+            box-shadow: var(--shadow-sm);
+            flex-shrink: 0;
+            min-height: 3rem;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            font-weight: 600;
+        }
+
+        .brand .logo {
+            font-size: 1.125rem;
+            letter-spacing: 0.05em;
+            color: var(--accent);
+        }
+
+        .brand .symbol {
+            font-size: 1rem;
+            color: var(--text-primary);
+            padding: 0.125rem 0.5rem;
+            background: var(--bg-tertiary);
+            border-radius: 0.25rem;
+        }
+
+        .brand .mode {
+            font-size: 0.75rem;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            padding: 0.125rem 0.5rem;
+            border-radius: 0.25rem;
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+        }
+
+        .brand .mode[data-mode="live"] {
+            background: rgba(248, 81, 73, 0.15);
+            color: var(--color-loss);
+        }
+
+        .brand .mode[data-mode="shadow"] {
+            background: rgba(210, 153, 34, 0.15);
+            color: var(--risk-warn);
+        }
+
+        .brand .mode[data-mode="backtest"] {
+            background: rgba(88, 166, 255, 0.15);
+            color: var(--accent);
+        }
+
+        .topbar-spacer {
+            flex: 1;
+        }
+
+        /* 连接状态指示 */
+        .conn-status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+        }
+
+        .conn-status .dot {
+            display: inline-block;
+            width: 0.5rem;
+            height: 0.5rem;
+            border-radius: 50%;
+            background: var(--text-muted);
+            transition: background 0.2s;
+        }
+
+        .conn-status[data-status="connected"] .dot {
+            background: var(--color-profit);
+            box-shadow: 0 0 6px var(--color-profit);
+        }
+
+        .conn-status[data-status="connecting"] .dot {
+            background: var(--risk-warn);
+            animation: pulse 1s infinite;
+        }
+
+        .conn-status[data-status="disconnected"] .dot,
+        .conn-status[data-status="failed"] .dot {
+            background: var(--color-loss);
+            box-shadow: 0 0 6px var(--color-loss);
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        /* UTC 时钟 */
+        .clock {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            min-width: 6rem;
+        }
+
+        /* 主题切换 */
+        .theme-btn {
+            padding: 0.375rem 0.75rem;
+            border-radius: 0.375rem;
+            background: var(--bg-tertiary);
+            font-size: 0.875rem;
+            transition: background 0.15s;
+        }
+
+        .theme-btn:hover {
+            background: var(--bg-hover);
+        }
+
+        /* 紧急停止按钮 */
+        .emergency-btn {
+            padding: 0.5rem 1rem;
+            font-size: 0.875rem;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            color: #ffffff;
+            background: var(--risk-halt);
+            border-radius: 0.375rem;
+            box-shadow: var(--shadow-sm);
+            transition: background 0.15s, transform 0.1s;
+        }
+
+        .emergency-btn:hover {
+            background: #b32020;
+        }
+
+        .emergency-btn:active {
+            transform: scale(0.98);
+        }
+
+        .emergency-btn[data-triggered="true"] {
+            background: var(--text-muted);
+            pointer-events: none;
+        }
+
+        /* ---------- 3.2 紧急横幅 ---------- */
+        .emergency-banner {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 0.75rem 1rem;
+            background: var(--risk-halt);
+            color: #ffffff;
+            font-weight: 600;
+            flex-shrink: 0;
+            border-bottom: 2px solid #b32020;
+        }
+
+        .emergency-banner[hidden] {
+            display: none;
+        }
+
+        .emergency-banner .pulse {
+            display: inline-block;
+            width: 0.75rem;
+            height: 0.75rem;
+            border-radius: 50%;
+            background: #ffffff;
+            animation: pulse 0.8s infinite;
+        }
+
+        .emergency-banner .spacer {
+            flex: 1;
+        }
+
+        .emergency-banner .clear-btn {
+            padding: 0.375rem 0.75rem;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 0.25rem;
+            color: #ffffff;
+            font-weight: 600;
+            font-size: 0.875rem;
+        }
+
+        .emergency-banner .clear-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+
+        /* ---------- 3.3 状态栏 ---------- */
+        .status-bar {
+            display: flex;
+            gap: 1.5rem;
+            padding: 0.5rem 1rem;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-default);
+            flex-shrink: 0;
+            overflow-x: auto;
+            scrollbar-width: thin;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            white-space: nowrap;
+        }
+
+        .status-item .label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .status-item .value {
+            font-size: 0.9375rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .status-item .value.profit {
+            color: var(--color-profit);
+        }
+
+        .status-item .value.loss {
+            color: var(--color-loss);
+        }
+
+        .status-item .value.neutral {
+            color: var(--color-neutral);
+        }
+
+        /* 状态徽章 */
+        .badge {
+            display: inline-block;
+            padding: 0.125rem 0.5rem;
+            border-radius: 0.25rem;
+            font-size: 0.8125rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .badge[data-risk="normal"] {
+            background: rgba(63, 185, 80, 0.15);
+            color: var(--risk-normal);
+        }
+        .badge[data-risk="warn"] {
+            background: rgba(210, 153, 34, 0.15);
+            color: var(--risk-warn);
+        }
+        .badge[data-risk="reduce"] {
+            background: rgba(251, 133, 0, 0.15);
+            color: var(--risk-reduce);
+        }
+        .badge[data-risk="close_only"] {
+            background: rgba(240, 136, 62, 0.15);
+            color: var(--risk-close-only);
+        }
+        .badge[data-risk="halt"] {
+            background: rgba(218, 54, 51, 0.15);
+            color: var(--risk-halt);
+        }
+
+        /* ---------- 3.4 主区域 ---------- */
+        .main-area {
+            flex: 1;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) clamp(280px, 22vw, 640px);
+            min-height: 0;
+            min-width: 0;
+        }
+
+        /* ---------- 3.5 图表区 ---------- */
+        .chart-area {
+            display: grid;
+            grid-template-rows:
+                auto
+                minmax(0, 1fr)
+                clamp(100px, 10vh, 200px)
+                clamp(70px, 7vh, 140px);
+            grid-template-columns: 1fr;
+            gap: 0.5rem;
+            padding: 0.5rem;
+            min-height: 0;
+            min-width: 0;
+            background: var(--bg-primary);
+        }
+
+        .chart-header {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 0.25rem 0.5rem;
+        }
+
+        .chart-header .chart-title {
+            font-size: 0.9375rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .chart-controls {
+            display: flex;
+            gap: 0.25rem;
+            margin-left: auto;
+        }
+
+        .chart-controls button {
+            padding: 0.25rem 0.625rem;
+            font-size: 0.8125rem;
+            color: var(--text-secondary);
+            background: var(--bg-tertiary);
+            border-radius: 0.25rem;
+            transition: all 0.15s;
+        }
+
+        .chart-controls button:hover {
+            background: var(--bg-hover);
+            color: var(--text-primary);
+        }
+
+        .chart-controls button.active {
+            background: var(--accent);
+            color: #ffffff;
+        }
+
+        /* 图表容器 */
+        #kline-chart,
+        #indicator-chart,
+        #orderflow-chart {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            min-height: 0;
+            background: var(--bg-secondary);
+            border-radius: 0.375rem;
+            border: 1px solid var(--border-default);
+            overflow: hidden;
+        }
+
+        /* 骨架屏（加载中） */
+        .skeleton {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-muted);
+            font-size: 0.875rem;
+        }
+
+        .skeleton::before {
+            content: "Loading…";
+            animation: pulse 1.5s infinite;
+        }
+
+        /* ---------- 3.6 侧栏 ---------- */
+        .side-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            padding: 0.5rem;
+            padding-left: 0;
+            background: var(--bg-primary);
+            border-left: 1px solid var(--border-default);
+            overflow-y: auto;
+            min-height: 0;
+        }
+
+        .panel-section {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-default);
+            border-radius: 0.375rem;
+            padding: 0.75rem;
+            flex-shrink: 0;
+        }
+
+        .panel-section h3 {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 0.5rem;
+        }
+
+        /* 活跃轮次 */
+        .round-info {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.5rem 0.75rem;
+            font-size: 0.8125rem;
+        }
+
+        .round-info .field {
+            display: flex;
+            flex-direction: column;
+            gap: 0.125rem;
+        }
+
+        .round-info .field .label {
+            font-size: 0.6875rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .round-info .field .value {
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .round-info.empty .field {
+            grid-column: 1 / -1;
+            text-align: center;
+            color: var(--text-muted);
+            padding: 0.5rem 0;
+        }
+
+        /* 最近轮次 */
+        .recent-rounds {
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+            max-height: 16rem;
+            overflow-y: auto;
+        }
+
+        .recent-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.375rem 0.5rem;
+            font-size: 0.8125rem;
+            background: var(--bg-tertiary);
+            border-radius: 0.25rem;
+            border-left: 3px solid transparent;
+        }
+
+        .recent-item[data-pnl="positive"] {
+            border-left-color: var(--color-profit);
+        }
+
+        .recent-item[data-pnl="negative"] {
+            border-left-color: var(--color-loss);
+        }
+
+        .recent-item .direction {
+            font-weight: 600;
+            min-width: 3rem;
+        }
+
+        .recent-item .direction[data-side="long"] {
+            color: var(--color-profit);
+        }
+
+        .recent-item .direction[data-side="short"] {
+            color: var(--color-loss);
+        }
+
+        .recent-item .reason {
+            flex: 1;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .recent-item .r {
+            font-weight: 600;
+            min-width: 3.5rem;
+            text-align: right;
+        }
+
+        .recent-item .r.profit {
+            color: var(--color-profit);
+        }
+
+        .recent-item .r.loss {
+            color: var(--color-loss);
+        }
+
+        /* 系统健康 */
+        .health-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.375rem;
+            font-size: 0.8125rem;
+        }
+
+        .health-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .health-row .name {
+            flex: 1;
+            color: var(--text-secondary);
+        }
+
+        .health-row .status {
+            display: inline-block;
+            width: 0.5rem;
+            height: 0.5rem;
+            border-radius: 50%;
+        }
+
+        .health-row .status.ok {
+            background: var(--color-profit);
+        }
+
+        .health-row .status.warn {
+            background: var(--risk-warn);
+        }
+
+        .health-row .status.fail {
+            background: var(--color-loss);
+        }
+
+        .health-row .detail {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        /* ---------- 3.7 响应式 ---------- */
+        @media (max-width: 1200px) {
+            .main-area {
+                grid-template-columns: minmax(0, 1fr) clamp(240px, 28vw, 320px);
+            }
+            .status-bar {
+                gap: 1rem;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .main-area {
+                grid-template-columns: 1fr;
+                grid-template-rows: minmax(0, 1fr) auto;
+            }
+            .side-panel {
+                border-left: none;
+                border-top: 1px solid var(--border-default);
+                max-height: 40vh;
+                padding-left: 0.5rem;
+            }
+            .topbar {
+                flex-wrap: wrap;
+                gap: 0.5rem;
+            }
+        }
+
+        /* 减少动效（无障碍） */
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.01ms !important;
+                transition-duration: 0.01ms !important;
+            }
+        }
+
+        /* 打印样式 */
+        @media print {
+            .topbar, .side-panel, .emergency-banner,
+            .chart-controls, .theme-btn, .emergency-btn {
+                display: none;
+            }
+            .chart-area {
+                grid-template-rows: 1fr;
+            }
+        }
+
+        /* 隐藏工具类 */
+        [hidden] {
+            display: none !important;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="dashboard" id="dashboard">
+
+        <!-- ============================================================
+             顶栏
+             ============================================================ -->
+        <header class="topbar" role="banner">
+            <div class="brand">
+                <span class="logo">QUANT</span>
+                <span class="symbol" id="symbol-display" title="Trading symbol">
+                    BTCUSDT
+                </span>
+                <span class="mode" id="mode-display" data-mode="live">
+                    LIVE
+                </span>
+            </div>
+
+            <div class="topbar-spacer"></div>
+
+            <div
+                class="conn-status"
+                id="conn-status"
+                data-status="connecting"
+                role="status"
+                aria-live="polite"
+            >
+                <span class="dot" aria-hidden="true"></span>
+                <span class="text" id="conn-text">Connecting</span>
+            </div>
+
+            <div
+                class="clock num"
+                id="clock"
+                title="UTC time"
+                aria-label="Current UTC time"
+            >
+                --:--:--
+            </div>
+
+            <button
+                class="theme-btn"
+                id="theme-btn"
+                type="button"
+                aria-label="Toggle theme"
+                title="切换主题"
+            >
+                ☀️
+            </button>
+
+            <button
+                class="emergency-btn"
+                id="emergency-btn"
+                type="button"
+                aria-label="Emergency stop all trading"
+                title="紧急停止 (Ctrl+Shift+E)"
+                data-triggered="false"
+            >
+                EMERGENCY STOP
+            </button>
+        </header>
+
+        <!-- ============================================================
+             紧急停止横幅
+             ============================================================ -->
+        <div
+            class="emergency-banner"
+            id="emergency-banner"
+            role="alert"
+            aria-live="assertive"
+            hidden
+        >
+            <span class="pulse" aria-hidden="true"></span>
+            <span>EMERGENCY STOP ACTIVE</span>
+            <span class="num" id="emergency-reason"></span>
+            <span class="spacer"></span>
+            <button
+                class="clear-btn"
+                id="emergency-clear-btn"
+                type="button"
+            >
+                清除并恢复
+            </button>
+        </div>
+
+        <!-- ============================================================
+             状态栏
+             ============================================================ -->
+        <div class="status-bar" role="toolbar" aria-label="System status">
+            <div class="status-item">
+                <span class="label">State</span>
+                <span class="value num" id="state-value">IDLE</span>
+            </div>
+
+            <div class="status-item">
+                <span class="label">Risk</span>
+                <span
+                    class="badge"
+                    id="risk-value"
+                    data-risk="normal"
+                >
+                    NORMAL
+                </span>
+            </div>
+
+            <div class="status-item">
+                <span class="label">Daily PnL</span>
+                <span class="value num neutral" id="daily-pnl">0.00</span>
+            </div>
+
+            <div class="status-item">
+                <span class="label">Drawdown</span>
+                <span class="value num" id="drawdown">0.00%</span>
+            </div>
+
+            <div class="status-item">
+                <span class="label">Margin</span>
+                <span class="value num" id="margin-ratio">0.00%</span>
+            </div>
+
+            <div class="status-item">
+                <span class="label">Param</span>
+                <span class="value num" id="param-ver">v1.0.0</span>
+            </div>
+
+            <div class="status-item">
+                <span class="label">Equity</span>
+                <span class="value num" id="equity">10000.00</span>
+            </div>
+        </div>
+
+        <!-- ============================================================
+             主区域：图表 + 侧栏
+             ============================================================ -->
+        <div class="main-area">
+
+            <!-- ---------- 图表区 ---------- -->
+            <main class="chart-area" role="main" aria-label="Market charts">
+                <div class="chart-header">
+                    <span class="chart-title" id="chart-title">
+                        BTCUSDT · 3m
+                    </span>
+                    <div
+                        class="chart-controls"
+                        role="tablist"
+                        aria-label="Chart interval"
+                    >
+                        <button
+                            type="button"
+                            data-interval="3m"
+                            class="active"
+                            role="tab"
+                            aria-selected="true"
+                        >3m</button>
+                        <button
+                            type="button"
+                            data-interval="5m"
+                            role="tab"
+                            aria-selected="false"
+                        >5m</button>
+                        <button
+                            type="button"
+                            data-interval="15m"
+                            role="tab"
+                            aria-selected="false"
+                        >15m</button>
+                        <button
+                            type="button"
+                            data-interval="1h"
+                            role="tab"
+                            aria-selected="false"
+                        >1h</button>
+                    </div>
+                </div>
+
+                <!-- K 线主图 -->
+                <div
+                    id="kline-chart"
+                    class="skeleton"
+                    role="img"
+                    aria-label="Kline chart"
+                ></div>
+
+                <!-- 指标副图 -->
+                <div
+                    id="indicator-chart"
+                    class="skeleton"
+                    role="img"
+                    aria-label="Indicator chart"
+                ></div>
+
+                <!-- 订单流副图（Step 2 预留） -->
+                <div
+                    id="orderflow-chart"
+                    class="skeleton"
+                    role="img"
+                    aria-label="Orderflow chart"
+                ></div>
+            </main>
+
+            <!-- ---------- 侧栏 ---------- -->
+            <aside class="side-panel" role="complementary">
+
+                <!-- 活跃轮次 -->
+                <section class="panel-section" aria-labelledby="round-title">
+                    <h3 id="round-title">Active Round</h3>
+                    <div class="round-info empty" id="round-info">
+                        <div class="field">
+                            <span class="label">No active round</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 最近轮次 -->
+                <section class="panel-section" aria-labelledby="recent-title">
+                    <h3 id="recent-title">Recent Rounds</h3>
+                    <div class="recent-rounds" id="recent-rounds">
+                        <div class="recent-item" style="color: var(--text-muted); justify-content: center;">
+                            <span>暂无记录</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 系统健康 -->
+                <section class="panel-section" aria-labelledby="health-title">
+                    <h3 id="health-title">System Health</h3>
+                    <div class="health-list" id="health-list">
+                        <div class="health-row">
+                            <span class="name">WebSocket</span>
+                            <span class="status" id="health-ws"></span>
+                            <span class="detail" id="health-ws-detail">--</span>
+                        </div>
+                        <div class="health-row">
+                            <span class="name">REST API</span>
+                            <span class="status" id="health-rest"></span>
+                            <span class="detail" id="health-rest-detail">--</span>
+                        </div>
+                        <div class="health-row">
+                            <span class="name">Database</span>
+                            <span class="status" id="health-db"></span>
+                            <span class="detail" id="health-db-detail">--</span>
+                        </div>
+                        <div class="health-row">
+                            <span class="name">Clock</span>
+                            <span class="status" id="health-clock"></span>
+                            <span class="detail" id="health-clock-detail">--</span>
+                        </div>
+                        <div class="health-row">
+                            <span class="name">Risk Engine</span>
+                            <span class="status" id="health-risk"></span>
+                            <span class="detail" id="health-risk-detail">--</span>
+                        </div>
+                    </div>
+                </section>
+
+            </aside>
+        </div>
+    </div>
+
+    <!-- ============================================================
+         主题切换脚本（内联，独立于 app.js）
+         ============================================================ -->
+    <script>
+        (function () {
+            'use strict';
+
+            const THEME_KEY = 'quant_theme';
+            const root = document.documentElement;
+            const btn = document.getElementById('theme-btn');
+
+            function applyTheme(theme) {
+                root.setAttribute('data-theme', theme);
+                if (btn) {
+                    btn.textContent = theme === 'dark' ? '☀️' : '🌙';
+                    btn.setAttribute(
+                        'aria-label',
+                        theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'
+                    );
+                }
+                try {
+                    localStorage.setItem(THEME_KEY, theme);
+                } catch (e) { /* ignore */ }
+            }
+
+            function toggleTheme() {
+                const current = root.getAttribute('data-theme') || 'dark';
+                applyTheme(current === 'dark' ? 'light' : 'dark');
+            }
+
+            if (btn) {
+                btn.addEventListener('click', toggleTheme);
+                // 初始化按钮文本
+                const current = root.getAttribute('data-theme') || 'dark';
+                btn.textContent = current === 'dark' ? '☀️' : '🌙';
+            }
+        })();
+    </script>
+
+    <!-- ============================================================
+         UTC 时钟脚本（内联，独立于 app.js）
+         ============================================================ -->
+    <script>
+        (function () {
+            'use strict';
+            const el = document.getElementById('clock');
+            if (!el) return;
+
+            function pad(n) { return n < 10 ? '0' + n : String(n); }
+
+            function tick() {
+                const d = new Date();
+                const hh = pad(d.getUTCHours());
+                const mm = pad(d.getUTCMinutes());
+                const ss = pad(d.getUTCSeconds());
+                el.textContent = hh + ':' + mm + ':' + ss + ' UTC';
+            }
+
+            tick();
+            setInterval(tick, 1000);
+        })();
+    </script>
+
+    <!-- ============================================================
+         紧急停止快捷键（Ctrl+Shift+E）
+         ============================================================ -->
+    <script>
+        (function () {
+            'use strict';
+
+            document.addEventListener('keydown', function (e) {
+                // Ctrl+Shift+E
+                if (e.ctrlKey && e.shiftKey && (e.key === 'E' || e.key === 'e')) {
+                    e.preventDefault();
+                    const btn = document.getElementById('emergency-btn');
+                    if (btn && btn.dataset.triggered !== 'true') {
+                        btn.click();
+                    }
+                }
+            });
+        })();
+    </script>
+
+    <!-- ============================================================
+         主应用逻辑（外部模块）
+         此文件负责：
+         - WebSocket 连接与重连
+         - 图表初始化与更新
+         - 状态栏、侧栏数据绑定
+         - 紧急停止按钮交互
+         - 周期切换
+         ============================================================ -->
+    <script type="module" src="js/app.js"></script>
+
+    <!-- 兜底：若 app.js 加载失败，至少让页面可见 -->
+    <noscript>
+        <div style="position: fixed; bottom: 1rem; left: 1rem;
+                    padding: 0.75rem 1rem; background: #da3633;
+                    color: #fff; border-radius: 0.375rem;
+                    font-size: 0.875rem; z-index: 9999;">
+            JavaScript 未启用。请启用 JavaScript 后刷新页面。
+        </div>
+    </noscript>
+</body>
+</html>
