@@ -1,0 +1,350 @@
+# ============================================================================
+# config/step1.yaml — Step 1 最小运行集参数
+# ============================================================================
+#
+# 本文件覆盖 base.yaml 中的同名参数。
+# 加载顺序：base.yaml → step1.yaml → symbols/{symbol}.yaml
+# 环境变量可用 ${VAR:-default} 语法引用。
+#
+# 当前 Step：1（最小运行集：3因子 + 趋势轮次 + 基础风控 + 市价单）
+#
+# 本文件不做的事：
+#   - 不做加仓（Step 3）
+#   - 不做反向做单（Step 3）
+#   - 不做分批逃顶（Step 3）
+#   - 不做网格（Step 2）
+#   - 不做 DDE / 聪明钱 / SR映射（Step 2）
+#   - 不做调度器（Step 2）
+#   - 不做 AI（Step 3）
+#   - 不做多品种（Step 4）
+#
+# 参数组约束（启动时自动校验）：
+#   1. k_min_noise_buffer < k_stop_pyramid（Step 1 无 k_stop_pyramid，跳过）
+#   2. daily_dd_limit < daily_dd_halt
+#   3. daily_dd_warn < daily_dd_reduce < daily_dd_close_only < daily_dd_halt
+#   4. 所有风控参数 <= base.yaml 的 safety_limits 硬上限
+#   5. 因子权重之和 == 1.0
+#   6. 每个因子权重 ∈ [0.1, 0.5]
+#
+# 参数变更记录：见 PARAM_TABLE.md 附录 B
+# 参数版本：v1.0.0
+#
+# 作者：张三
+# 审查：比蒙（策略）、乐高（执行）
+# ============================================================================
+
+version: "1.0.0"
+current_step: 1
+param_version: "1.0.0"           # 参数版本号
+param_freeze_during_round: true  # 轮次进行中参数冻结，不允许热更新
+
+
+# ============================================================================
+# 因子配置（Step 1 三个因子）
+# ============================================================================
+# 权重来源：最近 90 天 BTC 永续 3 分钟 K 线的 IC 加权
+# 约束：sum(weights) == 1.0，每个权重 ∈ [0.1, 0.5]
+# 调整要求：每次调整需回测 30 天 + 影子 7 天，记录到 PARAM_TABLE.md
+# ============================================================================
+factors:
+  # 分位数归一化窗口（覆盖 base.yaml 默认值 500）
+  quantile_window: 500
+
+  # 输出精度
+  output_precision: 6
+
+  # 预热根数（覆盖 base.yaml 默认值 500）
+  # 前 500 根 K 线只推入缓冲，不触发决策
+  warmup_bars: 500
+
+  # 因子计算异常时的兜底值
+  # 连续 3 根 K 线同一因子异常，标记 degraded，权重降为 0
+  fallback_value: 0.0
+
+  # 异常值判定（覆盖 base.yaml 默认值 5.0）
+  outlier_sigma: 5.0
+
+  # ---- 动量因子 ----
+  momentum:
+    enabled: true
+    weight: 0.35                    # IC 加权，来源见 PARAM_TABLE.md
+    roc_period: 3                   # ROC 窗口（根），敏感性分析见 FACTOR_SPEC.md
+    roc_weight: 0.7                 # ROC 在合成值中的权重
+    accel_weight: 0.3               # 加速度在合成值中的权重
+    # 合成公式：raw = 0.7 * ROC(3) + 0.3 * accel
+
+  # ---- OBI 因子 ----
+  obi:
+    enabled: true
+    weight: 0.40                    # IC 加权
+    levels: 10                      # 盘口档位
+    decay_k: 0.15                   # 距离衰减系数（历史回测最优）
+    smooth_half_life_s: 2.0         # 时间平滑半衰期（秒，≈10 拍）
+    # 公式：raw = (bid_weighted - ask_weighted) / (bid_weighted + ask_weighted)
+    # 时间平滑：smoothed = alpha * raw + (1 - alpha) * smoothed_prev
+
+  # ---- 成交量因子 ----
+  volume:
+    enabled: true
+    weight: 0.25                    # IC 加权
+    ma_window: 20                   # 成交量均值窗口（根，≈1小时）
+    # 公式：ratio = volume / mean(volume[-20:])
+    # 归一化到 [0, 1]
+
+  # ---- Step 2+ 预留因子（Step 1 不加载）----
+  # dde:
+  #   enabled: false
+  #   weight: 0.20
+  # smart_money:
+  #   enabled: false
+  #   weight: 0.15
+  # sr_mapper:
+  #   enabled: false
+  #   width_ratio: 0.3
+
+
+# ============================================================================
+# 策略配置（趋势轮次系统）
+# ============================================================================
+# 状态机：IDLE → BREAKOUT_CONFIRM → TREND_RIDE → TOP_DETECT → IDLE
+# Step 1 只有三个状态，不做加仓/反向/分批逃顶
+# ============================================================================
+strategy:
+  # ---- 均线 ----
+  ma_period: 25                     # 均线周期（根）
+  ma_slope_window: 3                # 均线斜率窗口
+
+  # ---- 突破确认 ----
+  breakout:
+    # 一致性窗口最小值（动态取过去 500 根 K 线的 70% 分位）
+    # 固定值 5 作为下限，防止极端情况下窗口过短
+    consistency_run_min: 5
+    consistency_run_percentile: 0.70  # 动态分位
+    consistency_decay: 2              # 反向符号出现时，run_length 衰减 2
+    cusum_threshold: 0.6              # CUSUM 变点检测阈值（ATR 归一化）
+
+  # ---- 趋势评分 ----
+  trend_score:
+    # 评分加权：momentum*0.35 + obi*0.40 + volume*0.25
+    # 权重已在 factors 段定义，此处仅定义评分相关参数
+    percentile_window: 500          # 分位数归一化窗口
+    # 进场阈值：trend_score > entry_threshold 触发状态迁移
+    entry_threshold: 0.50
+    # 阈值来源：历史回测 0.40-0.60 区间，0.50 夏普最优（见 PARAM_TABLE.md）
+
+  # ---- 逃顶 ----
+  top_detect:
+    # 背离分阈值：Step 1 不分批，全平
+    # 低于 0.55 太敏感（噪声），高于 0.75 太迟钝（回吐多）
+    divergence_threshold: 0.65
+    # 背离需持续 N 根 K 线确认，过滤单根噪声
+    divergence_persist_bars: 2
+    # 背离分计算权重
+    price_div_weight: 0.40           # 价格背离
+    vol_div_weight: 0.30             # 量能背离
+    micro_div_weight: 0.30           # 微观结构背离
+
+  # ---- Step 2+ 预留策略（Step 1 不加载）----
+  # pyramid:
+  #   enabled: false
+  #   k_atr: 1.0
+  #   r_threshold: 1.5
+  # reverse:
+  #   enabled: false
+  # grid:
+  #   enabled: false
+
+
+# ============================================================================
+# 轮次与止损
+# ============================================================================
+# Step 1 不做加仓，倒金字塔参数推迟到 Step 3
+# ============================================================================
+round:
+  # ---- 止损 ----
+  initial_stop_atr: 1.5             # 首仓止损距离（ATR 倍数）
+  k_min_noise_buffer: 0.6           # 噪声缓冲下限（ATR 倍数）
+  # 约束：k_min_noise_buffer < k_stop_pyramid（Step 1 无加仓，跳过）
+
+  # ---- 移动止损 ----
+  trailing_stop:
+    enabled: true
+    # 止损上移触发条件：趋势质量恶化（ROC 反向 + OBI 反向 + DDE 反向）
+    # 不是"价格走远 N 个 ATR"，而是"趋势质量下降"
+    quality_drop_roc_ratio: 0.3     # ROC 低于峰值的 30%
+    quality_drop_obi_negative: true # OBI 转负
+    quality_drop_dde_negative: true # DDE 转负（Step 1 DDE 未启用，视为满足）
+
+  # ---- 平仓 ----
+  close:
+    # Step 1 全平，不分批
+    split_close: false
+    # 平仓类型
+    close_type: "MARKET"
+
+  # ---- Step 3+ 预留（Step 1 不加载）----
+  # pyramid:
+  #   ratios: [1.0, 0.8, 0.4]
+  #   k_atr: 1.0
+  #   r_threshold: 1.5
+  #   k_stop_ratio: 1.2
+  #   k_min: 0.6
+
+
+# ============================================================================
+# 风控（覆盖 base.yaml 默认值）
+# ============================================================================
+# 所有值 <= base.yaml 的 safety_limits 硬上限
+# ============================================================================
+risk:
+  # ---- 单笔风险 ----
+  # 单笔最大亏损占权益比例
+  # 预留 0.1% 滑点余量，实际 R0 用 0.7%
+  per_trade_risk: 0.007
+
+  # ---- 日回撤分阶段熔断 ----
+  # 1% 警告
+  daily_dd_warn: 0.01
+  # 2% 降频（仓位减半）
+  daily_dd_reduce: 0.02
+  # 2.5% 只平仓不开仓
+  daily_dd_close_only: 0.025
+  # 3% 熔断（紧急停止）
+  daily_dd_halt: 0.03
+  # 约束：warn < reduce < close_only < halt
+
+  # ---- 仓位 ----
+  max_position_ratio: 0.3           # 最大仓位 30% 权益
+  leverage: 3                       # 杠杆 3 倍
+
+  # ---- 保证金率 ----
+  margin_ratio_warn: 0.6            # 60% 预警
+  margin_ratio_halt: 0.8            # 80% 强制减仓
+
+  # ---- 连续亏损熔断 ----
+  consecutive_loss_reduce: 5        # 连续亏损 5 轮，仓位减半
+  consecutive_loss_pause: 8         # 连续亏损 8 轮，暂停开仓
+  consecutive_loss_pause_s: 3600    # 暂停时长（秒，1 小时）
+
+  # ---- 市场突变检测 ----
+  market_shock_threshold: 0.03      # 1 分钟波动 > 3% 判定为突变
+  market_shock_pause_s: 60          # 突变后暂停开仓 60 秒
+
+  # ---- 保护期 ----
+  protection_rounds: 20             # 前 20 轮半仓
+  protection_qty_ratio: 0.3         # 保护期仓位比例
+
+  # ---- 紧急停止 ----
+  emergency_close_type: "MARKET"    # 紧急停止用市价平仓
+
+
+# ============================================================================
+# 执行（覆盖 base.yaml 默认值）
+# ============================================================================
+# Step 1 只用市价单，不支持限价单
+# ============================================================================
+execution:
+  # ---- 订单类型 ----
+  # Step 1 固定为 MARKET，不允许改为 LIMIT
+  order_type: "MARKET"
+
+  # ---- 滑点保护 ----
+  # 市价单最大滑点（基点）。超过则改为限价单挂在第 5 档。
+  max_slippage_bps: 50
+
+  # ---- 价格偏离保护 ----
+  # 信号价与市价偏离上限。超过则拒单。
+  max_price_deviation: 0.005        # 0.5%
+
+  # ---- 超时 ----
+  # 下单超时（毫秒）。超时后查 clientOrderId 确认状态。
+  order_timeout_ms: 2000
+  # 撤单超时（毫秒）
+  cancel_timeout_ms: 1000
+
+  # ---- 服务器端止损 ----
+  # 止损单用标记价格触发（不用最新成交价）
+  stop_working_type: "MARK_PRICE"
+  # 止损单类型
+  stop_order_type: "STOP_MARKET"
+
+  # ---- 虚拟券商（回测/影子模式）----
+  virtual:
+    # 成交延迟模拟（毫秒）
+    latency_ms: 80
+    # 滑点容忍度
+    slippage_tolerance: 0.003
+    # 手续费率（taker 0.04%）
+    taker_fee_rate: 0.0004
+
+  # ---- 限频（Step 1 固定，不调）----
+  rate_limit:
+    orders_per_10s: 45
+    weight_per_min: 1000
+    bucket_refill_rate: 4.5
+
+
+# ============================================================================
+# 数据（覆盖 base.yaml 默认值）
+# ============================================================================
+data:
+  # ---- K 线 ----
+  kline_interval: "3m"
+  kline_max_bars: 1000
+
+  # ---- 盘口 ----
+  snapshot_max_age_ms: 3000         # 快照超过 3 秒标记 stale
+  depth_levels: 20
+
+  # ---- WebSocket ----
+  ws_reconnect_delay_s: 1
+  ws_reconnect_max_delay_s: 30
+  ws_ping_interval_s: 20
+
+
+# ============================================================================
+# 系统（覆盖 base.yaml 默认值）
+# ============================================================================
+system:
+  # ---- 心跳 ----
+  heartbeat_interval_s: 30
+  heartbeat_stale_threshold_s: 120
+
+  # ---- 守护 ----
+  max_consecutive_errors: 5
+
+  # ---- 日志（Step 1 基础功能）----
+  log_level: "INFO"
+
+  # ---- Step 1 不做的 ----
+  # 三路对账、幽灵订单处理、优雅停机、错误码完整映射、健康度降级
+  # 这些在 Step 2 的 step2.yaml 中启用
+
+
+# ============================================================================
+# Step 1 明确不做的（推迟到后续 Step）
+# ============================================================================
+# 以下配置在 Step 1 不加载，保留注释作为接口预留：
+#
+# Step 2:
+#   - factors.dde / factors.smart_money / factors.sr_mapper
+#   - strategy.grid / strategy.regime_dispatcher
+#   - execution.fill_model_limit（限价排队模型）
+#   - system.reconciler / system.shutdown_protocol / system.health_monitor
+#   - risk.policy_composite（组合层压力测试）
+#
+# Step 3:
+#   - round.pyramid（倒金字塔加仓）
+#   - strategy.reverse（反向做单）
+#   - strategy.top_detect.split_close（分批逃顶）
+#   - ai.advisor_local / ai.log_summarizer / ai.round_attributor
+#   - analytics.factor_attribution / analytics.drawdown_analysis
+#
+# Step 4:
+#   - system.multi_symbol（多品种）
+#   - system.ha_controller（双机热备）
+#   - frontend.multi_symbol（多品种前端）
+#
+# Step 5:
+#   - monitoring.*（监控告警）
+#   - deploy.*（部署脚本）
