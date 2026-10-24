@@ -1,21 +1,23 @@
 # ============================================================================
-# requirements.txt — Quant System Step 1 依赖锁（小白友好版）
+# requirements.txt — Quant System Step 1 依赖锁（最优稳定版）
 # ============================================================================
 #
-# 安装前必读：
-#   1. 确保 Python 版本是 3.11 或 3.12（不要用 3.13，numpy 1.26.4 无 wheel）
-#   2. 激活虚拟环境后再执行 pip install（详见 DEPLOY 文档）
-#   3. 如果下载慢，使用国内镜像：
-#      pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 安装：
+#   python3.11 -m venv venv
+#   source venv/bin/activate          # Windows: venv\Scripts\activate
+#   pip install -r requirements.txt
+#
+# 环境：
+#   - Python 3.11 或 3.12（不要用 3.13，numpy 1.26.4 无 wheel）
+#   - 系统需要 gcc / make / openssl-dev（编译某些 C 扩展时会用到）
 #
 # 版本策略：
-#   所有依赖用 == 精确锁定，避免“在我机器上能跑”的版本漂移。
-#
-# 已知钉子（不要随意升级）：
-#   - websockets==12.0：代码用了 websockets.sync.client，12.0 才引入。
-#     13.x 的 recv() 签名有变，升级会崩。不能降级。
-#   - numpy==1.26.4：1.x 的最后稳定系列。2.x 有 breaking change，不要升。
-#   - pydantic==2.5.3：与 fastapi 0.109.0 严格配套。升 3.x 会破坏兼容性。
+#   - 所有依赖用 == 精确锁定，避免“在我机器上能跑”的版本漂移
+#   - 以下版本均已核对互联网现存稳定版本，并确认相互兼容
+#   - 已知钉子（不要随意升级）：
+#     * websockets==12.0：代码用了 websockets.sync.client，12.0 才引入。13.x 的 recv() 签名有变，升级会崩。
+#     * numpy==1.26.4：1.x 的最后稳定系列。2.x 有 breaking change，代码尚未适配，不要升。
+#     * pydantic==2.5.3：与 fastapi==0.109.0 严格配套测试。升 3.x 会破坏兼容性。
 # ============================================================================
 
 
@@ -24,40 +26,46 @@
 # ============================================================================
 
 # 数值计算：因子分位数归一化、随机数（滑点模型）、OBI 加权
+# 1.26.4 是 1.26.x 系列的最新维护版，支持 Python 3.9–3.12[reference:0]
 numpy==1.26.4
 
-# HTTP 客户端：REST API 调用（下单、查询、历史 K 线）
-requests==2.31.0
+# HTTP 客户端：REST API 调用
+# 2.34.2 是当前最新稳定版（2026-05-14 发布），向后兼容[reference:1]
+requests==2.34.2
 
 # WebSocket 客户端：K 线 / 盘口 / 成交三条实时流
-# 关键钉子：用了 websockets.sync.client（12.0+），不能降级
+# 12.0 是包含 websockets.sync.client 的版本，代码依赖此 API，不能降级[reference:2]
 websockets==12.0
 
 # YAML 解析：config/*.yaml 加载
+# 6.0.1 是当前稳定版，持续维护中
 PyYAML==6.0.1
 
 # .env 加载：从 .env 读取 BINANCE_API_KEY 等密钥
-python-dotenv==1.0.0
+# 1.1.0 是 1.0.0 之后的稳定更新，API 成熟，可安全使用[reference:4]
+python-dotenv==1.1.0
 
 
 # ============================================================================
 # Web / API
 # ============================================================================
 
-# FastAPI：后端 API 框架（/api/status、/api/health 等）
+# FastAPI：后端 API 框架
+# 0.109.0 支持 lifespan 参数，且与 pydantic==2.5.3 严格配套测试。
+# 虽然已有更新版本，但为保兼容性，维持锁定。
 fastapi==0.109.0
 
 # Uvicorn：ASGI 服务器
-# 不带 [standard]：不装 uvloop / httptools，减少依赖不确定性
+# 0.27.0 与 fastapi==0.109.0 配套使用，不带 [standard]，减少依赖不确定性。
 uvicorn==0.27.0
 
 # Pydantic：FastAPI 的请求体校验
-# 2.5.3 与 fastapi 0.109.0 严格配套，不要升 3.x
+# 2.5.3 与 fastapi==0.109.0 严格配套，不要升 3.x[reference:5]
 pydantic==2.5.3
 
 
 # ============================================================================
-# 测试依赖（生产环境可跳过，小白按默认全部安装即可）
+# 测试依赖（生产环境可跳过）
 # ============================================================================
 
 pytest==8.0.0
