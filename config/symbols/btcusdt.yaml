@@ -1,0 +1,260 @@
+# ============================================================================
+# config/symbols/btcusdt.yaml — BTCUSDT 永续合约配置
+# ============================================================================
+#
+# 加载顺序：base.yaml → step1.yaml → symbols/btcusdt.yaml
+# 后者覆盖前者。但本文件只允许覆盖白名单参数（见 overrides 段）。
+#
+# 本文件是交易所约束的本地镜像。镜像可以缓存，但启动时必须和交易所对账。
+# 对不上，实盘拒绝启动（on_mismatch: reject_start）。
+#
+# 交易所：Binance USDⓈ-M Futures
+# 合约：BTCUSDT PERPETUAL
+#
+# 作者：张三
+# 审查：比蒙（策略）、乐高（执行）
+# 版本：v1.0.0
+# ============================================================================
+
+version: "1.0.0"
+schema: 1
+
+# ============================================================================
+# 交易对标识
+# ============================================================================
+symbol:
+  # REST/WS 通用标识
+  exchange: "BINANCE"
+  market: "USDⓈ-M_FUTURES"
+  symbol: "BTCUSDT"              # REST 用大写
+  symbol_lower: "btcusdt"        # WebSocket 用小写
+  base_asset: "BTC"
+  quote_asset: "USDT"
+  margin_asset: "USDT"
+  contract_type: "PERPETUAL"
+  qty_unit: "BASE_ASSET"         # 数量单位是 BTC，不是张
+  status: "TRADING"              # 启动时校验，非 TRADING 拒绝启动
+
+# ============================================================================
+# 交易所精度与过滤器（source: exchange）
+# ============================================================================
+# 以下值来自 /fapi/v1/exchangeInfo，本地缓存仅用于启动前预检。
+# 启动时拉取交易所最新值比对，不一致按 on_mismatch 处理。
+# ============================================================================
+exchange_filters:
+  source: "exchange"
+  price_tick_size: 0.1           # 价格最小变动
+  price_precision: 1             # 价格小数位
+  qty_step_size: 0.001           # 数量最小变动
+  qty_precision: 3               # 数量小数位
+  min_qty: 0.001                 # 最小下单量
+  max_qty: 1000                  # 最大下单量（启动时以交易所为准）
+  min_notional: 5.0              # 最小名义价值 USDT
+  max_notional: 5000000          # 最大名义价值（启动时以交易所为准）
+  market_max_qty: 120            # 市价单最大数量（启动时以交易所为准）
+  limit_max_qty: 1000            # 限价单最大数量（启动时以交易所为准）
+
+# ============================================================================
+# 杠杆与保证金
+# ============================================================================
+leverage:
+  # 交易所允许的最大杠杆（仅记录，不直接使用）
+  exchange_max_leverage: 125
+  # 我们实际使用的杠杆（覆盖 step1.yaml）
+  default_leverage: 3
+  # 安全上限（覆盖 base.yaml safety_limits）
+  safety_max_leverage: 5
+
+margin:
+  mode: "CROSSED"                # 全仓。所有轮次共享保证金
+  position_mode: "ONE_WAY"       # 单向持仓。Step 1 不做双向同时持仓
+  multi_assets_mode: false       # 多资产保证金模式关闭
+
+# ============================================================================
+# 手续费（source: exchange）
+# ============================================================================
+# 默认普通用户费率。VIP 等级不同，启动时拉 /fapi/v1/commissionRate 校验。
+# ============================================================================
+fees:
+  source: "exchange"
+  maker_fee_rate: 0.0002         # 0.02%
+  taker_fee_rate: 0.0004         # 0.04%
+  fee_tolerance: 0.0001          # 启动校验容忍度
+
+# ============================================================================
+# 资金费率
+# ============================================================================
+funding:
+  interval_hours: 8
+  times_utc: ["00:00", "08:00", "16:00"]
+  # 资金费率上下限（以交易所为准，启动时校验）
+  rate_cap: 0.0075               # +0.75%
+  rate_floor: -0.0075            # -0.75%
+
+  # 资金费率结算前后降频保护
+  guard:
+    enabled: true
+    before_minutes: 15
+    after_minutes: 15
+    qty_multiplier: 0.5          # 仓位减半
+    block_new_rounds: false      # 不禁止新轮次，但仓位减半
+    # Step 1 无网格；Step 2 网格在此窗口暂停
+    pause_grid: true
+
+# ============================================================================
+# 订单类型与执行约束
+# ============================================================================
+orders:
+  # Step 1 只允许市价单和服务器端止损单
+  allowed_order_types: ["MARKET", "STOP_MARKET"]
+  # Step 2 预留
+  reserved_order_types: ["LIMIT", "TAKE_PROFIT_MARKET"]
+
+  # 平仓单必须 reduceOnly
+  close_order_reduce_only: true
+  # Step 1 不用 closePosition=true，用 reduceOnly
+  close_position_flag: false
+
+  # 止损触发价格类型
+  stop_working_type: "MARK_PRICE"
+  stop_order_type: "STOP_MARKET"
+
+  # Step 2 预留：限价单 timeInForce
+  limit_time_in_force: ["GTC", "IOC", "FOK", "GTX"]
+
+  # 价格偏离保护基准
+  price_deviation_reference: "MARK_PRICE"
+
+# ============================================================================
+# 执行覆盖（覆盖 step1.yaml）
+# ============================================================================
+execution:
+  # BTC 盘口深，滑点保护可以稍宽；山寨币应更窄
+  max_slippage_bps: 50
+  # 价格偏离上限
+  max_price_deviation: 0.005
+  # 下单超时
+  order_timeout_ms: 2000
+  # 撤单超时
+  cancel_timeout_ms: 1000
+  # 虚拟券商成交延迟
+  virtual_latency_ms: 80
+  # 虚拟券商滑点容忍
+  virtual_slippage_tolerance: 0.003
+
+# ============================================================================
+# 风控覆盖（覆盖 step1.yaml）
+# ============================================================================
+risk:
+  # BTC 波动相对低，单笔风险按 step1 默认 0.7%
+  per_trade_risk: 0.007
+  # 最大仓位 30% 权益
+  max_position_ratio: 0.3
+  # 杠杆 3 倍
+  leverage: 3
+  # 日回撤分阶段熔断
+  daily_dd_warn: 0.01
+  daily_dd_reduce: 0.02
+  daily_dd_close_only: 0.025
+  daily_dd_halt: 0.03
+  # 保证金率
+  margin_ratio_warn: 0.6
+  margin_ratio_halt: 0.8
+  # 连续亏损
+  consecutive_loss_reduce: 5
+  consecutive_loss_pause: 8
+  consecutive_loss_pause_s: 3600
+  # 市场突变
+  market_shock_threshold: 0.03
+  market_shock_pause_s: 60
+
+# ============================================================================
+# 数据流
+# ============================================================================
+data:
+  kline_interval: "3m"
+  kline_max_bars: 1000
+  depth_levels: 20
+  snapshot_max_age_ms: 3000
+  atr_reference_interval: "3m"   # Step 1 止损用 3m ATR
+
+  # WebSocket 流（拼接 symbol_lower）
+  ws_streams:
+    - "{symbol_lower}@kline_3m"
+    - "{symbol_lower}@depth@100ms"
+    - "{symbol_lower}@aggTrade"
+    - "{symbol_lower}@account"   # 账户流（Step 1 实盘用于成交回报，影子不用）
+
+# ============================================================================
+# 启动校验
+# ============================================================================
+validation:
+  # 启动时拉 exchangeInfo 与本地缓存比对
+  exchange_info_check: true
+  # 不一致时行为：实盘 reject_start，影子/回测 warn
+  on_mismatch:
+    live: "reject_start"
+    shadow: "warn"
+    backtest: "warn"
+
+  # 精度必须完全一致（tick/step 不允差）
+  precision_exact: true
+  # 最小名义价值完全一致
+  min_notional_exact: true
+  # 手续费率容忍度
+  fee_rate_tolerance: 0.0001
+  # 杠杆检查：实际杠杆 <= safety_max_leverage
+  leverage_check: true
+  # 交易对状态必须是 TRADING
+  status_check: true
+
+# ============================================================================
+# 覆盖白名单
+# ============================================================================
+# symbols 文件只允许覆盖以下参数。不在白名单内的参数，即使写了也忽略并报警。
+# ============================================================================
+overrides:
+  allowed:
+    - "execution.max_slippage_bps"
+    - "execution.max_price_deviation"
+    - "execution.order_timeout_ms"
+    - "execution.cancel_timeout_ms"
+    - "execution.virtual_latency_ms"
+    - "execution.virtual_slippage_tolerance"
+    - "risk.per_trade_risk"
+    - "risk.max_position_ratio"
+    - "risk.leverage"
+    - "risk.daily_dd_warn"
+    - "risk.daily_dd_reduce"
+    - "risk.daily_dd_close_only"
+    - "risk.daily_dd_halt"
+    - "risk.margin_ratio_warn"
+    - "risk.margin_ratio_halt"
+    - "risk.consecutive_loss_reduce"
+    - "risk.consecutive_loss_pause"
+    - "risk.consecutive_loss_pause_s"
+    - "risk.market_shock_threshold"
+    - "risk.market_shock_pause_s"
+    - "data.kline_interval"
+    - "data.kline_max_bars"
+    - "data.depth_levels"
+    - "data.snapshot_max_age_ms"
+    - "data.atr_reference_interval"
+
+# ============================================================================
+# Step 2+ 预留（Step 1 不加载）
+# ============================================================================
+# session_weights:
+#   "00-04": { entry_threshold: 0.45 }
+#   "08-12": { entry_threshold: 0.50 }
+#   "12-16": { entry_threshold: 0.58 }
+#   "16-20": { entry_threshold: 0.52 }
+#
+# limit_price_protection:
+#   enabled: true
+#   max_distance_atr: 3.0
+#
+# grid:
+#   spacing_k: 0.5
+#   levels: 12
+#   budget_ratio: 0.15
