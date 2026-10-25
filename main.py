@@ -1,667 +1,337 @@
-#!/usr/bin/env python3
 """
-main.py - 量化系统 Step 1 主入口
+main.py — Quant System 主调度中心（模块化重铸版）
 
-职责：
-  1. 配置加载与校验
-  2. 日志初始化
-  3. 模块自动发现与组装（MANIFEST 驱动）
-  4. 服务启动（数据流 / 状态机 / API）
-  5. 状态恢复（live 模式）
-  6. 优雅停机
+【设计初衷】
+1. 绝不揉搓业务逻辑：本文件不负责解析 K 线，不负责计算因子，更不负责拼接 WebSocket 数据。
+2. 回归自动装配：废弃手写硬编码组装，全面启用 ModuleRegistry，让所有符合 MANIFEST 规范的模块自动就位。
+3. 确立数据总线：以 KlineAuthority（K线权威源）作为系统的唯一数据心脏，由它汇聚底层 WS 数据，统一下发给状态机和前端。
 
-启动顺序（不可调换）：
-  配置 → 日志 → PID 锁 → 磁盘检查 → 时钟 → 模块发现 → 模块组装
-  → 风控 → 数据 → 执行 → 策略 → 状态恢复 → API → 信号注册
-
-作者：张三
-审查：比蒙（策略层）、乐高（执行层）
-版本：Step 1 v1.0
+【数据流向】
+币安 WebSocket → data/ws_*.py → KlineAuthority → 因子/策略计算 → 状态机迁移
+                                     ↓
+                              (收线回调 on_close)
+                                     ↓
+                              WebSocket 广播 → 前端面板
 """
 
 import argparse
-import os
-import signal
+import logging
 import sys
-import threading
 import time
-import traceback
+import threading
+import asyncio
+import signal
 from pathlib import Path
 
 import yaml
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 
-# ---- 核心抽象 ----
-from core.manifest import validate_manifest, ManifestError
+# 1. 核心抽象层 (契约)
+from core.manifest import ModuleRegistry
 
-# ---- 系统层 ----
+# 2. 系统基建层
 from system.log_setup import setup_logging
 from system.clock_hybrid import HybridClock
-from system.param_store import ParamStore
 from system.persister import StatePersister
-from system.rate_limiter import RateLimiter
 from system.kline_authority import KlineAuthority
 from system.data_buffer import RingBuffer
-from system.kline_repair import KlineRepair
-from system.order_idempotent import OrderIdGenerator
-from system.module_registry import ModuleRegistry
+from system.param_store import ParamStore
 
-# ---- 数据层 ----
+# 3. 数据接入层 (底层的网络通信)
 from data.ws_kline import KlineStream
 from data.ws_depth import DepthStream
 from data.ws_aggtrade import AggTradeStream
-from data.rest_client import RestClient
-from data.historical_loader import HistoricalLoader
-from data.tick_db import TickDB
 
-# ---- 因子 / 策略 / 状态 / 轮次 ----
-from factors.factor_registry import FactorRegistry
+# 4. 策略核心与轮次管理
 from states.state_machine import StateMachine
 from rounds.round_manager import RoundManager
 
-# ---- 执行 ----
-from execution.gateway_binance import BinanceGateway
-from execution.gateway_virtual import VirtualGateway
-from execution.slippage_model import SlippageModel
-from execution.fill_model_market import MarketFillModel
-
-# ---- 风控 ----
-from risk.policy_minimal import MinimalRiskPolicy
-from risk.emergency_stop import EmergencyStop
-
-# ---- API ----
-from api.server import create_app
-import uvicorn
-
-
-# ==================== 退出码 ====================
-EXIT_OK = 0
-EXIT_CONFIG_ERROR = 2
-EXIT_DEPENDENCY_ERROR = 3
-EXIT_RUNTIME_ERROR = 4
-EXIT_EMERGENCY = 5
-
-
-class BootError(Exception):
-    """启动阶段的可预期错误。捕获后打印清晰信息，按 code 退出。"""
-    def __init__(self, msg, code=EXIT_CONFIG_ERROR):
-        super().__init__(msg)
-        self.code = code
+logger = logging.getLogger("main")
 
 
 class QuantSystem:
-    def __init__(self, mode: str, config_dir: str, symbol: str):
+    def __init__(self, mode: str, symbol: str, config_dir: str):
         self.mode = mode
+        self.symbol = symbol.upper()
         self.config_dir = Path(config_dir)
-        self.symbol = symbol.lower()
-
-        self.config: dict = {}
-        self.instances: dict = {}
-        self.services: dict = {"streams": []}
-
+        self.config = {}
+        
+        # 核心实例仓库（由 ModuleRegistry 自动填充）
+        self.instances = {}
+        
+        # 后台服务与生命周期控制
+        self.services = {"streams": []}
+        self.api_server = None
+        self.api_loop = None
+        self.active_ws_clients = set()
         self.shutdown_event = threading.Event()
-        self._shutdown_lock = threading.Lock()
-        self._shutdown_done = False
-        self._pid_file: Path | None = None
-        self._api_server: uvicorn.Server | None = None
 
-        self._hb_ts: float = 0.0
-        self._consecutive_errors: int = 0
-        self._max_consecutive_errors: int = 5
+    def load_config(self):
+        """分层加载配置：base -> step1 -> symbol，后者覆盖前者"""
+        base_file = self.config_dir / "base.yaml"
+        step_file = self.config_dir / "step1.yaml"
+        sym_file = self.config_dir / "symbols" / f"{self.symbol.lower()}.yaml"
 
-        # 最近盘口快照，供 K 线收线时算 OBI
-        self._current_snapshot: dict | None = None
-        self._snapshot_lock = threading.Lock()
+        for p in [base_file, step_file, sym_file]:
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    self.config.update(yaml.safe_load(f) or {})
 
-        self._emergency_triggered = False
-
-    # ==================== 启动阶段 ====================
+        # 强制覆盖运行时必须的参数，防止配置文件漏写
+        self.config.update({
+            "symbol": self.symbol,
+            "mode": self.mode,
+            "log_dir": "logs/runtime",
+            "db_path": "data/runtime_quant.db",
+        })
 
     def bootstrap(self):
-        self._load_config()         # 1. 配置（失败走 stderr）
-        self._setup_logging()       # 2. 日志（成功后一切走 logger）
-        self._acquire_pid_lock()    # 3. PID 原子锁
-        self._check_disk()          # 4. 磁盘
-        self._init_clock()          # 5. 时钟（REST 校准）
-        self._discover_modules()    # 6. 模块发现 + fallback 循环检测
-        self._assemble_modules()    # 7. 按 step 组装
-        self._init_risk()           # 8. 风控（先于策略）
-        self._init_data()           # 9. 数据流 + 缓冲
-        self._init_execution()      # 10. 执行网关（依赖数据）
-        self._init_strategy()       # 11. 策略 + 状态机 + 轮次
-        self._recover_state()       # 12. live 状态恢复
-        self._init_api()            # 13. API
-        self._register_signals()    # 14. 信号
-
-    def _load_config(self):
-        base = self.config_dir / "base.yaml"
-        step = self.config_dir / "step1.yaml"
-        sym = self.config_dir / "symbols" / f"{self.symbol}.yaml"
-        for p in (base, step, sym):
-            if not p.exists():
-                raise BootError(f"配置文件不存在: {p}", EXIT_CONFIG_ERROR)
-        try:
-            merged = {}
-            for p in (base, step, sym):
-                with open(p, "r", encoding="utf-8") as f:
-                    data = yaml.safe_load(f) or {}
-                    if not isinstance(data, dict):
-                        raise BootError(f"{p} 顶层必须是字典", EXIT_CONFIG_ERROR)
-                    merged.update(data)
-        except yaml.YAMLError as e:
-            raise BootError(f"YAML 解析失败: {e}", EXIT_CONFIG_ERROR)
-
-        required = [
-            "log_level", "log_dir", "db_path", "api_port",
-            "current_step", "mode", "symbol",
-            "binance_api_key", "binance_api_secret",
-        ]
-        missing = [k for k in required if k not in merged]
-        if missing:
-            raise BootError(f"配置缺失字段: {missing}", EXIT_CONFIG_ERROR)
-
-        if merged["symbol"] != self.symbol:
-            raise BootError(
-                f"命令行 symbol={self.symbol} 与配置 symbol={merged['symbol']} 不一致",
-                EXIT_CONFIG_ERROR,
-            )
-        if merged["mode"] != self.mode:
-            raise BootError(
-                f"命令行 mode={self.mode} 与配置 mode={merged['mode']} 不一致",
-                EXIT_CONFIG_ERROR,
-            )
-        if merged["current_step"] != 1:
-            raise BootError(
-                f"main.py 是 Step 1 入口，配置 current_step 必须为 1，"
-                f"当前={merged['current_step']}",
-                EXIT_CONFIG_ERROR,
-            )
-        self.config = merged
-
-    def _setup_logging(self):
+        """
+        核心装配区（回归初衷）：
+        1. 初始化基础设施
+        2. 使用 ModuleRegistry 扫描并装配因子、策略、网关
+        3. 将核心数据源 (KlineAuthority) 和轮次、状态机连接起来
+        """
+        # ================= 1. 基础系统层 =================
         Path(self.config["log_dir"]).mkdir(parents=True, exist_ok=True)
-        global logger
-        logger = setup_logging(
-            log_dir=self.config["log_dir"],
-            level=self.config["log_level"],
-            mode=self.mode,
-            symbol=self.symbol,
-        )
-        logger.info("=" * 60)
-        logger.info(f"Quant System Step1 启动  mode={self.mode} symbol={self.symbol} pid={os.getpid()}")
-        logger.info("=" * 60)
+        setup_logging(log_dir=self.config["log_dir"], level="INFO", mode=self.mode, symbol=self.symbol)
+        logger.info(f"=== 系统启动 mode={self.mode} symbol={self.symbol} ===")
+        
+        self.instances["config"] = self.config
+        self.instances["clock"] = HybridClock(config=self.config)
+        self.instances["persister"] = StatePersister(self.config["db_path"])
+        self.instances["persister"].init_schema()
+        self.instances["buffer"] = RingBuffer(maxlen=1000)
+        self.instances["param_store"] = ParamStore(self.config)
 
-    def _acquire_pid_lock(self):
-        pid_path = self.config_dir / f".quant.{self.symbol}.pid"
-        try:
-            fd = os.open(pid_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            try:
-                old = int(pid_path.read_text().strip())
-            except Exception:
-                old = -1
-            if old > 0:
-                try:
-                    os.kill(old, 0)
-                    raise BootError(
-                        f"另一个实例正在运行 (pid={old})", EXIT_RUNTIME_ERROR
-                    )
-                except ProcessLookupError:
-                    logger.warning(f"发现陈旧 pid 文件 (pid={old} 已死)，覆盖")
-                    pid_path.unlink()
-            # 重试一次
-            try:
-                fd = os.open(pid_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            except FileExistsError:
-                raise BootError(f"pid 文件锁竞争失败: {pid_path}", EXIT_RUNTIME_ERROR)
-        os.write(fd, str(os.getpid()).encode())
-        os.close(fd)
-        self._pid_file = pid_path
-        logger.info(f"PID 锁获取 pid={os.getpid()}")
+        # ================= 2. 数据权威源 =================
+        # 所有的行情数据将汇入这里，它负责统一时间戳、缓存盘口和K线。
+        self.instances["kline_authority"] = KlineAuthority(self.config)
 
-    def _check_disk(self):
-        import shutil
-        log_dir = Path(self.config["log_dir"])
-        _, _, free = shutil.disk_usage(log_dir)
-        free_gb = free / (1024 ** 3)
-        logger.info(f"磁盘剩余 {free_gb:.2f} GB")
-        if free_gb < 5:
-            raise BootError(f"磁盘不足 5GB，拒绝启动: {free_gb:.2f} GB", EXIT_RUNTIME_ERROR)
+        # ================= 3. 模块自动装配 =================
+        # 扫描当前目录下的所有模块，读取其 MANIFEST，自动实例化
+        logger.info("开始扫描并自动组装模块...")
+        registry = ModuleRegistry(root_dir=".", current_step=1)
+        registry.set_config(self.config)
+        assembled = registry.assemble(self.config)
+        self.instances.update(assembled.instances)
 
-    def _init_clock(self):
-        rest = self._make_rest_client()
-        self.instances["rest_client"] = rest
-        clk = HybridClock()
-        try:
-            clk.sync_from_binance(rest)
-        except Exception as e:
-            logger.warning(f"时钟同步失败，用本地时间兜底: {e}")
-        self.instances["clock"] = clk
-        offset = clk.get_market_offset_ms()
-        logger.info(f"时钟偏移 market_offset={offset:.1f} ms")
-        if abs(offset) > 1000:
-            logger.warning("时钟偏移 > 1s，请检查 NTP")
-
-    def _make_rest_client(self) -> RestClient:
-        return RestClient(
-            api_key=self.config.get("binance_api_key", ""),
-            api_secret=self.config.get("binance_api_secret", ""),
-            base_url=self.config.get("rest_base_url", "https://fapi.binance.com"),
-        )
-
-    def _discover_modules(self):
-        reg = ModuleRegistry(
-            root_dir=self.config.get("quant_root", "quant/"),
-            current_step=self.config["current_step"],
-        )
-        try:
-            self._module_registry = reg
-            self._discovered = reg.discover()
-        except Exception as e:
-            raise BootError(f"模块发现失败: {e}", EXIT_DEPENDENCY_ERROR)
-
-        logger.info(f"发现模块 {len(self._discovered)} 个")
-
-        # fallback 链循环检测
-        for name in self._discovered:
-            seen, cur = set(), name
-            while cur:
-                if cur in seen:
-                    raise BootError(
-                        f"fallback 链循环: {name} → … → {cur}",
-                        EXIT_DEPENDENCY_ERROR,
-                    )
-                seen.add(cur)
-                info = self._discovered.get(cur)
-                if not info:
-                    break
-                cur = info["manifest"].get("fallback")
-
-    def _assemble_modules(self):
-        try:
-            self.instances.update(self._module_registry.assemble(self.config))
-        except Exception as e:
-            raise BootError(f"模块组装失败: {e}", EXIT_DEPENDENCY_ERROR)
-
-        logger.info(f"组装实例 {len(self.instances)} 个")
-
-        # 关键能力检查（Step1 必须有）
-        required_caps = {
-            "monotonic_clock", "logging", "rate_limit", "order_idempotent",
-            "orderbook_snapshot", "kline_stream", "trade_stream",
-        }
-        have = set()
-        for info in self._discovered.values():
-            have.update(info["manifest"].get("capabilities", []))
-        missing = required_caps - have
-        if missing:
-            raise BootError(f"缺少关键能力: {missing}", EXIT_DEPENDENCY_ERROR)
-
-        # 别名：让 gateway_binance 能用统一的 rate_limiter / id_gen
-        self.instances.setdefault("rate_limiter", self.instances.get("rate_limit"))
-        self.instances.setdefault("order_idempotent_gen",
-                                  self.instances.get("order_idempotent"))
-
-    def _init_risk(self):
-        equity = float(self.config.get("initial_equity", 1000.0))
-
-        # live 模式：从交易所拿真实权益
-        if self.mode == "live":
-            try:
-                acct = self.instances["rest_client"].get_account_light(
-                    self.config["binance_api_key"],
-                    self.config["binance_api_secret"],
-                )
-                equity = float(acct.get("totalWalletBalance", equity))
-                logger.info(f"实盘权益来自交易所: {equity:.2f}")
-            except Exception as e:
-                logger.warning(f"实盘权益拉取失败，用配置兜底: {e}")
-
-        self.instances["equity_snapshot"] = equity
-        policy = MinimalRiskPolicy(
-            equity=equity,
-            per_trade_risk=float(self.config.get("per_trade_risk", 0.007)),
-            daily_dd_limit=float(self.config.get("daily_dd_limit", 0.02)),
-            daily_dd_halt=float(self.config.get("daily_dd_halt", 0.03)),
-        )
-        self.instances["risk_policy"] = policy
-        logger.info(
-            f"风控就绪 equity={equity:.2f} "
-            f"per_trade_risk={policy.per_trade_risk} "
-            f"dd_limit={policy.daily_dd_limit}"
-        )
-
-    def _init_data(self):
-        tickdb = TickDB(self.config["db_path"])
-        self.instances["tick_db"] = tickdb
-
-        buffer = RingBuffer(maxlen=1000)
-        self.instances["buffer"] = buffer
-
-        # live：预热缓冲
-        if self.mode in ("live", "shadow"):
-            try:
-                loader = HistoricalLoader(self.instances["rest_client"])
-                bars = loader.load_recent_klines(self.symbol, "3m", 1000)
-                for b in bars:
-                    buffer.push(b)
-                logger.info(f"历史 K 线预热 {len(bars)} 根")
-            except Exception as e:
-                logger.warning(f"历史 K 线预热失败（缓冲为空，谨慎运行）: {e}")
-
-        self.instances["kline_repair"] = KlineRepair(
-            rest=self.instances["rest_client"],
-            tickdb=tickdb,
-        )
-
-        # 数据流
-        if self.mode in ("live", "shadow"):
-            streams = [
-                KlineStream(
-                    symbol=self.symbol,
-                    on_bar=self._on_bar,
-                ),
-                DepthStream(symbol=self.symbol, on_snapshot=self._on_depth),
-                AggTradeStream(symbol=self.symbol, on_trade=self._on_trade),
-            ]
-            self.services["streams"] = streams
-            logger.info(f"数据流 {len(streams)} 个（live/shadow）")
-        else:
-            logger.info("backtest 模式：不启动实时数据流")
-
-    def _init_execution(self):
-        clock = self.instances["clock"]
-        slippage = SlippageModel()
-        self.instances["slippage"] = slippage
-
-        if self.mode == "live":
-            api_key = self.config["binance_api_key"]
-            api_secret = self.config["binance_api_secret"]
-            if not api_key or not api_secret:
-                raise BootError("live 模式必须配置 API Key/Secret", EXIT_CONFIG_ERROR)
-
-            gw = BinanceGateway(
-                api_key=api_key,
-                api_secret=api_secret,
-                clock=clock,
-                rate_limiter=self.instances["rate_limiter"],
-                id_generator=self.instances["order_idempotent_gen"],
-                fill_model=MarketFillModel(),
-            )
-            # 权限探测
-            try:
-                gw.ping_account_light()
-                logger.info("账户权限探测通过")
-            except Exception as e:
-                raise BootError(f"账户探测失败，检查 API 权限: {e}", EXIT_DEPENDENCY_ERROR)
-        else:
-            # shadow / backtest：虚拟券商，按 K 线收盘价撮合
-            from execution.ring_buffer_feed import RingBufferFeed
-            feed = RingBufferFeed(self.instances["buffer"])
-            gw = VirtualGateway(
-                feed=feed,
-                slippage_model=slippage,
-                clock=clock,
-            )
-            if self.mode == "shadow":
-                logger.warning(
-                    "WARN: shadow 模式虚拟成交只按 K 线收盘价撮合，"
-                    "滑点由 SlippageModel 估算，非真实盘口成交。"
-                )
-
-        self.instances["gateway"] = gw
-
-    def _init_strategy(self):
-        # 因子注册：用 MANIFEST name 查实例
-        registry = FactorRegistry()
-        for fname in ("momentum", "obi", "volume"):
-            inst = self.instances.get(fname)
-            if inst is None:
-                raise BootError(f"因子缺失: {fname}", EXIT_DEPENDENCY_ERROR)
-            registry.register(fname, inst)
-        self.instances["factor_registry"] = registry
-
-        # 轮次管理
-        round_mgr = RoundManager(
-            risk_policy=self.instances["risk_policy"],
+        # ================= 4. 组装轮次管理器 =================
+        # 依赖 registry 中装配好的 risk_policy 和 gateway
+        self.instances["round_manager"] = RoundManager(
+            risk_policy=self.instances.get("risk_policy"),
             persister=self.instances["persister"],
+            clock=self.instances["clock"],
+            order_gateway=self.instances.get("gateway"),
+            id_generator=self.instances.get("order_idempotent"),
+            symbol=self.symbol,
+            config=self.config
         )
-        self.instances["round_manager"] = round_mgr
 
-        # 状态机：注入完整依赖
+        # ================= 5. 组装状态机 =================
+        # 提取策略，并把所有的上下文依赖注入状态机
+        strategies = {
+            name: inst for name, inst in self.instances.items() 
+            if getattr(inst, "name", "") == "trend_round" or name == "trend_round"
+        }
+        
         sm = StateMachine(
-            factor_registry=registry,
+            factor_registry=self.instances.get("factor_registry"),
+            strategies=strategies,
             config=self.config,
             persister=self.instances["persister"],
-            risk_policy=self.instances["risk_policy"],
-            order_gateway=self.instances["gateway"],
-            round_manager=round_mgr,
+            risk_policy=self.instances.get("risk_policy"),
+            order_gateway=self.instances.get("gateway"),
+            round_manager=self.instances["round_manager"],
+            clock=self.instances["clock"],
+            symbol=self.symbol,
+            kline_buffer=self.instances["buffer"]
         )
+        
+        # 显式注册四大状态（如果未来状态机也支持自动扫描，这部分可省略）
+        from states.state_idle import IdleState
+        from states.state_breakout import BreakoutConfirmState
+        from states.state_trend import TrendRideState
+        from states.state_top_detect import TopDetectState
+        
+        sm.register_state("idle", IdleState(self.config))
+        sm.register_state("breakout_confirm", BreakoutConfirmState(self.config))
+        sm.register_state("trend_ride", TrendRideState(self.config))
+        sm.register_state("top_detect", TopDetectState(self.config))
+        sm.validate()
+        
         self.instances["state_machine"] = sm
-        logger.info("策略/状态机/轮次 就绪")
+        logger.info("✅ 所有组件装配完毕！")
 
-    def _init_persister(self):
-        pers = StatePersister(self.config["db_path"])
-        pers.init_schema()
-        self.instances["persister"] = pers
-        logger.info(f"持久化就绪 db={self.config['db_path']}")
+    def start_data_streams(self):
+        """
+        启动底层 WebSocket 数据流，并将其接入 KlineAuthority。
+        """
+        ka = self.instances["kline_authority"]
+        sm = self.instances["state_machine"]
 
-    def _recover_state(self):
-        if self.mode != "live":
-            return
-        pers = self.instances["persister"]
-        try:
-            snap = pers.load_last_snapshot(self.symbol)
-        except Exception as e:
-            raise BootError(f"读取状态快照失败: {e}", EXIT_RUNTIME_ERROR)
+        # 1. 挂载 K 线收线回调（这是系统的心跳）
+        # 当底层 WS 拼凑出一根完整的 3 分钟 K 线时，触发此回调
+        def on_bar_close(bar, snapshot, trades):
+            # 驱动状态机（策略决策在这里发生）
+            sm.on_bar_close(bar, snapshot)
+            
+            # 打包推送到前端展示（只推必要的精简数据）
+            self.broadcast_to_ws("kline", {
+                "ts": bar.ts, 
+                "open": float(bar.open), 
+                "high": float(bar.high),
+                "low": float(bar.low), 
+                "close": float(bar.close), 
+                "volume": float(bar.volume),
+                "is_closed": True
+            })
+            
+        ka.register_on_close(on_bar_close)
 
-        if not snap or not snap.get("active_round"):
-            logger.info("无未完成轮次，跳过恢复")
-            return
-
-        logger.warning(f"发现未完成轮次: {snap['active_round']}")
-
-        # 拉交易所持仓（重试 3 次）
-        positions = None
-        for attempt in range(3):
-            try:
-                positions = self.instances["gateway"].get_positions()
-                break
-            except Exception as e:
-                logger.warning(f"拉持仓失败 (第{attempt+1}/3): {e}")
-                time.sleep(0.5 * (2 ** attempt))
-        if positions is None:
-            raise BootError(
-                "启动时拉取持仓失败，需人工确认（避免裸奔）",
-                EXIT_RUNTIME_ERROR,
-            )
-
-        try:
-            result = self.instances["round_manager"].recover(
-                snap["active_round"], positions
-            )
-            logger.info(f"恢复结果: {result}")
-        except Exception as e:
-            raise BootError(f"状态恢复失败，需人工确认: {e}", EXIT_RUNTIME_ERROR)
-
-    def _init_api(self):
-        app = create_app(self)
-        cfg = uvicorn.Config(
-            app,
-            host=self.config.get("api_host", "0.0.0.0"),
-            port=int(self.config.get("api_port", 8000)),
-            log_level="warning",
+        # 2. 实例化底层的 WebSocket 流，数据一律喂给 KlineAuthority
+        kline_ws = KlineStream(
+            symbol=self.symbol.lower(),
+            on_bar=lambda msg: ka.on_exchange_kline(msg),
+            config=self.config
         )
-        self._api_server = uvicorn.Server(cfg)
-        logger.info(f"API 就绪 :{cfg.port}")
+        depth_ws = DepthStream(
+            symbol=self.symbol.lower(),
+            on_snapshot=lambda snap: ka.on_depth(snap),
+            config=self.config
+        )
+        trade_ws = AggTradeStream(
+            symbol=self.symbol.lower(),
+            on_trade=lambda trade: ka.on_agg_trade(trade),
+            config=self.config
+        )
+        
+        self.services["streams"] = [kline_ws, depth_ws, trade_ws]
+        
+        # 3. 启动后台线程接收数据
+        for s in self.services["streams"]:
+            threading.Thread(target=s.run, daemon=True).start()
+        logger.info("🚀 底层数据流启动成功！正在接收币安行情...")
 
-    def _register_signals(self):
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
+    def start_api(self):
+        """启动 FastAPI 后端，处理前端请求与 WebSocket 连接"""
+        app = FastAPI()
 
-    # ==================== 运行时回调 ====================
-
-    def _on_bar(self, bar):
-        try:
-            self.instances["buffer"].push(bar)
-            with self._snapshot_lock:
-                snap = self._current_snapshot
-            self.instances["state_machine"].on_bar_close(bar, snap)
-            self._consecutive_errors = 0
-        except Exception:
-            self._consecutive_errors += 1
-            logger.error(
-                f"on_bar 异常 (连续 {self._consecutive_errors}/"
-                f"{self._max_consecutive_errors}):\n{traceback.format_exc()}"
-            )
-            if self._consecutive_errors >= self._max_consecutive_errors:
-                logger.critical("连续异常触发紧急停止")
-                self._trigger_emergency()
-
-    def _on_depth(self, snap):
-        try:
-            with self._snapshot_lock:
-                self._current_snapshot = snap
-        except Exception:
-            logger.error(f"on_depth 异常:\n{traceback.format_exc()}")
-
-    def _on_trade(self, trade):
-        try:
-            self.instances["tick_db"].append(trade)
-        except Exception:
-            logger.error(f"on_trade 异常:\n{traceback.format_exc()}")
-
-    # ==================== 主循环 ====================
-
-    def run(self):
-        logger.info("服务启动")
-        if self._api_server:
-            threading.Thread(
-                target=self._api_server.run, daemon=True, name="api-server"
-            ).start()
-
-        for s in self.services.get("streams", []):
-            threading.Thread(
-                target=s.run, daemon=True, name=s.__class__.__name__
-            ).start()
-
-        logger.info("所有线程已启动，进入主循环")
-        try:
-            while not self.shutdown_event.wait(timeout=1.0):
-                self._heartbeat()
-                if self._emergency_triggered:
-                    raise SystemExit(EXIT_EMERGENCY)
-        except KeyboardInterrupt:
-            logger.warning("KeyboardInterrupt")
-            self.shutdown_event.set()
-
-    def _heartbeat(self):
-        now = time.time()
-        if now - self._hb_ts < 30:
-            return
-        self._hb_ts = now
-        sm = self.instances.get("state_machine")
-        rm = self.instances.get("round_manager")
-        state = getattr(sm, "current_state", "unknown")
-        n_rounds = len(getattr(rm, "active_rounds", {})) if rm else 0
-        logger.info(f"heartbeat state={state} active_rounds={n_rounds}")
-
-    # ==================== 停机 ====================
-
-    def _handle_signal(self, signum, frame):
-        logger.warning(f"收到信号 {signum}，准备停机")
-        self.shutdown_event.set()
-
-    def _trigger_emergency(self):
-        self._emergency_triggered = True
-        try:
-            self.instances["gateway"].cancel_all()
-            self.instances["gateway"].close_all_positions()
-        except Exception:
-            logger.error(f"紧急停止异常:\n{traceback.format_exc()}")
-        self.shutdown_event.set()
-
-    def shutdown(self):
-        """幂等：第二次调用直接返回。"""
-        with self._shutdown_lock:
-            if self._shutdown_done:
-                return
-            self._shutdown_done = True
-
-        logger.info("=== 开始停机 ===")
-        try:
-            # 1. 停 API
-            if self._api_server:
-                self._api_server.should_exit = True
-                deadline = time.time() + 5
-                while self._api_server.started and time.time() < deadline:
-                    time.sleep(0.1)
-
-            # 2. 停数据流
-            for s in self.services.get("streams", []):
-                try:
-                    s.stop()
-                except Exception as e:
-                    logger.warning(f"停流失败 {s.__class__.__name__}: {e}")
-
-            # 3. live 模式：服务器端止损兜底（本地进程退出后仍有效）
-            if self.mode == "live":
-                try:
-                    self.instances["gateway"].ensure_server_side_stop()
-                    logger.info("服务器端止损已挂，持仓受保护")
-                except Exception as e:
-                    logger.error(f"服务器端止损挂单失败: {e}")
-
-            # 4. 持久化最后状态
+        @app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket):
+            await websocket.accept()
+            self.active_ws_clients.add(websocket)
+            
+            # 连接建立后，立刻发一次历史 K 线，让前端图表瞬间填满
+            recent = self.instances["kline_authority"].get_recent_bars(100)
+            if recent:
+                bars_data = [
+                    {"ts": b.ts, "open": float(b.open), "high": float(b.high), 
+                     "low": float(b.low), "close": float(b.close), "volume": float(b.volume)} 
+                    for b in recent
+                ]
+                await websocket.send_json({"type": "history", "ts": int(time.time()*1000), "data": bars_data})
+                
             try:
-                self.instances["persister"].flush()
-            except Exception as e:
-                logger.error(f"持久化失败: {e}")
+                while True:
+                    await websocket.receive_text()
+            except WebSocketDisconnect:
+                self.active_ws_clients.remove(websocket)
 
-            logger.info("=== 停机完成 ===")
-        except Exception:
-            logger.error(f"停机异常:\n{traceback.format_exc()}")
-        finally:
-            if self._pid_file and self._pid_file.exists():
+        # 挂载前端静态文件
+        if Path("frontend").exists():
+            app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
+
+        def run_server():
+            self.api_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.api_loop)
+            uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+
+        threading.Thread(target=run_server, daemon=True).start()
+        logger.info("API 与前端服务已启动: http://0.0.0.0:8000")
+
+    def start_status_broadcaster(self):
+        """每秒向前端广播一次系统的风控状态和活跃持仓"""
+        def run_broadcast():
+            while not self.shutdown_event.is_set():
                 try:
-                    self._pid_file.unlink()
+                    sm = self.instances.get("state_machine")
+                    rp = self.instances.get("risk_policy")
+                    rm = self.instances.get("round_manager")
+                    
+                    lvl = rp.get_risk_level() if rp else "normal"
+                    active_round = rm.get_active_round() if rm else None
+
+                    self.broadcast_to_ws("system_status", {
+                        "state": getattr(sm, "current_state", "idle") if sm else "idle",
+                        "risk": lvl.value if hasattr(lvl, "value") else str(lvl),
+                        "active_round": active_round
+                    })
                 except Exception:
                     pass
+                time.sleep(1.0)
+        threading.Thread(target=run_broadcast, daemon=True).start()
 
+    def broadcast_to_ws(self, msg_type: str, data: dict):
+        """跨线程安全：同步线程 -> 异步 FastAPI 的 WebSocket 广播"""
+        if not self.active_ws_clients or self.api_loop is None:
+            return
+        msg = {"type": msg_type, "ts": int(time.time() * 1000), "data": data}
+        asyncio.run_coroutine_threadsafe(self._async_broadcast(msg), self.api_loop)
 
-# ==================== 入口 ====================
+    async def _async_broadcast(self, msg: dict):
+        for ws in list(self.active_ws_clients):
+            try:
+                await ws.send_json(msg)
+            except Exception:
+                self.active_ws_clients.remove(ws)
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Quant System Step1")
-    p.add_argument("--mode", choices=["backtest", "shadow", "live"], required=True)
-    p.add_argument("--config", default="config", help="配置目录")
-    p.add_argument("--symbol", default="btcusdt")
-    return p.parse_args()
+    def stop(self):
+        """优雅停机处理"""
+        logger.info("收到停止信号，准备优雅停机...")
+        self.shutdown_event.set()
+        for s in self.services.get("streams", []):
+            if hasattr(s, "stop"):
+                s.stop()
+        logger.info("数据流已关闭，系统安全退出。")
+        sys.exit(0)
+
+    def run(self, with_api=False):
+        self.bootstrap()
+        
+        if with_api:
+            self.start_api()
+            time.sleep(1.5) # 等待 API 服务就绪
+            
+        self.start_status_broadcaster()
+        self.start_data_streams()
+        
+        logger.info("系统主循环运行中，按 Ctrl+C 退出...")
+        while not self.shutdown_event.is_set():
+            time.sleep(1)
 
 
 def main():
-    args = parse_args()
-    sys_obj = QuantSystem(args.mode, args.config, args.symbol)
-    code = EXIT_OK
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", default="shadow")
+    parser.add_argument("--symbol", default="btcusdt")
+    parser.add_argument("--config", default="config")
+    parser.add_argument("--with-api", action="store_true")
+    args = parser.parse_args()
+
+    system = QuantSystem(args.mode, args.symbol, args.config)
+    system.load_config()
+    
+    # 注册信号，保证按 Ctrl+C 时能安全停止 WS 线程
+    signal.signal(signal.SIGINT, lambda sig, frame: system.stop())
+    signal.signal(signal.SIGTERM, lambda sig, frame: system.stop())
 
     try:
-        sys_obj.bootstrap()
-        sys_obj.run()
-    except BootError as e:
-        print(f"[BOOT ERROR] {e}", file=sys.stderr)
-        code = e.code
-    except SystemExit as e:
-        code = int(e.code) if e.code is not None else EXIT_OK
+        system.run(with_api=args.with_api)
     except Exception as e:
-        print(f"[FATAL] {e}\n{traceback.format_exc()}", file=sys.stderr)
-        code = EXIT_RUNTIME_ERROR
-    finally:
-        try:
-            sys_obj.shutdown()
-        except Exception:
-            pass
-
-    sys.exit(code)
-
+        logger.critical(f"系统崩溃: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()
